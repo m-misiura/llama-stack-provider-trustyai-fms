@@ -13,7 +13,7 @@ maintainers = [
     {name = "GitHub: m-misiura"}
 ]
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 license = "Apache-2.0"
 dependencies = [
     "llama-stack",
