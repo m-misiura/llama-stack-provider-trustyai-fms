@@ -1,0 +1,22 @@
+version: '2'
+image_name: trial
+apis:
+  - safety
+  - shields
+
+providers:
+  safety:
+    - provider_id: trustyai_fms
+      provider_type: remote::trustyai_fms
+      config:
+        orchestrator_url: ${env.FMS_ORCHESTRATOR_URL}
+        shields: {}
+           
+server:
+  port: 8321
+  tls_certfile: null
+  tls_keyfile: null
+  
+external_providers_dir: ./providers.d
+
+shields: []
