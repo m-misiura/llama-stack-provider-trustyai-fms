@@ -1960,24 +1960,41 @@ class DetectorProvider(Safety, Shields):
         custom_categories = {}
         custom_scores = {}
         custom_applied_input_types = {} 
+        
         results = metadata.get("results", [])
+        
         for result in results:
             status = result.get("status", "pass")
-            detection_type = result.get("detection_type", "")
-            score = result.get("score", 0.0)
             is_violation = status == "violation"
-            # Create shield-specific category for ALL processed content
-            if detection_type:
-                custom_name = f"{shield_id}_{detection_type}".lower().replace(" ", "_").replace("-", "_")
-                custom_categories[custom_name] = is_violation  # True for violations, False for pass
-                custom_scores[custom_name] = score if score is not None else 0.0
-                custom_applied_input_types[custom_name] = ["text"]
-            else:
-                # For cases where detection_type is None - use violation-focused naming
-                custom_name = f"{shield_id}_violation".lower().replace(" ", "_").replace("-", "_")
-                custom_categories[custom_name] = is_violation  # False = no violation (safe)
-                custom_scores[custom_name] = score if score is not None else 0.0
-                custom_applied_input_types[custom_name] = ["text"]
+            individual_results = result.get("individual_detector_results", [])
+            for individual in individual_results:
+                detector_id = individual.get("detector_id", "")
+                det_type = individual.get("detection_type", "")
+                det_score = individual.get("score", 0.0)
+                det_status = individual.get("status", "pass")
+                det_is_violation = det_status == "violation"
+                if detector_id:
+                    if det_type:
+                        # Create detector-specific category with detection type
+                        detector_category = f"{detector_id}_{det_type}".lower().replace(" ", "_").replace("-", "_")
+                    else:
+                        # Fallback to detector name with violation suffix
+                        detector_category = f"{detector_id}_violation".lower().replace(" ", "_").replace("-", "_")
+                    
+                    custom_categories[detector_category] = det_is_violation
+                    custom_scores[detector_category] = det_score if det_score is not None else 0.0
+                    custom_applied_input_types[detector_category] = ["text"]
+            # FALLBACK: If no individual results, create shield-level category
+            if not individual_results:
+                detection_type = result.get("detection_type", "")
+                score = result.get("score", 0.0)
+                if detection_type:
+                    shield_category = f"{shield_id}_{detection_type}".lower().replace(" ", "_").replace("-", "_")
+                else:
+                    shield_category = f"{shield_id}_violation".lower().replace(" ", "_").replace("-", "_")
+                custom_categories[shield_category] = is_violation
+                custom_scores[shield_category] = score if score is not None else 0.0
+                custom_applied_input_types[shield_category] = ["text"]
         return {
             "categories": custom_categories, 
             "scores": custom_scores,
