@@ -16,7 +16,6 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
 dependencies = [
-    "llama-stack>=0.2.14",
     "fastapi",
     "opentelemetry-api",
     "opentelemetry-exporter-otlp",
