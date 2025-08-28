@@ -6,9 +6,10 @@ import logging
 import random
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from enum import Enum, auto
+from enum import Enum, StrEnum, auto
 from typing import Any, ClassVar, Dict, List, Optional, Tuple, cast
 from urllib.parse import urlparse
+import uuid
 import httpx
 
 from llama_stack.apis.inference import (
@@ -25,6 +26,8 @@ from llama_stack.apis.safety import (
     SafetyViolation,
     ShieldStore,
     ViolationLevel,
+    ModerationObject,
+    ModerationObjectResults
 )
 from llama_stack.apis.shields import ListShieldsResponse, Shield, Shields
 from llama_stack.providers.datatypes import ShieldsProtocolPrivate
@@ -128,6 +131,24 @@ class DetectionResult:
             **({"metadata": self.metadata} if self.metadata else {}),
         }
 
+class OpenAICategories(StrEnum):
+    """
+    Required set of categories in moderations api response
+    Local definition to replace the removed API enum
+    """
+    VIOLENCE = "violence"
+    VIOLENCE_GRAPHIC = "violence/graphic"
+    HARASSMENT = "harassment"
+    HARASSMENT_THREATENING = "harassment/threatening"
+    HATE = "hate"
+    HATE_THREATENING = "hate/threatening"
+    ILLICIT = "illicit"
+    ILLICIT_VIOLENT = "illicit/violent"
+    SEXUAL = "sexual"
+    SEXUAL_MINORS = "sexual/minors"
+    SELF_HARM = "self-harm"
+    SELF_HARM_INTENT = "self-harm/intent"
+    SELF_HARM_INSTRUCTIONS = "self-harm/instructions"
 
 class BaseDetector(Safety, ShieldsProtocolPrivate, ABC):
     """Base class for all safety detectors"""
@@ -1793,6 +1814,204 @@ class DetectorProvider(Safety, Shields):
                 )
             )
 
+    async def run_moderation(self, input: str | list[str], model: str) -> ModerationObject:
+        """OpenAI Compatible moderations API implementation."""
+        try:
+            # Step 1: Find shield by model name
+            shield_id = await self._get_shield_id_from_model(model)
+            # Step 2: Convert string inputs to Message objects
+            messages = self._convert_input_to_messages(input)
+            # Step 3: Run existing shield detection
+            shield_response = await self.run_shield(shield_id, messages)
+            # Step 4: Transform response to OpenAI format
+            moderation_results = self._transform_to_moderation_results(shield_response, input, shield_id)
+            return ModerationObject(
+                id=str(uuid.uuid4()),
+                model=model,
+                results=[moderation_results]
+            )
+        except Exception as e:
+            logger.error(f"Moderation API failed: {str(e)}", exc_info=True)
+            return ModerationObject(
+                id=str(uuid.uuid4()),
+                model=model,
+                results=[self._create_error_moderation_result(str(e), input)]
+            )
+    
+    async def _get_shield_id_from_model(self, model: str) -> str:
+        """Map model name to shield_id using provider_resource_id."""
+        shields_response = await self.list_shields()
+        matching_shields = [
+            shield.identifier 
+            for shield in shields_response.data 
+            if shield.provider_resource_id == model
+        ]
+        if not matching_shields:
+            raise ValueError(f"No shield found for model '{model}'. Available shields: {[s.identifier for s in shields_response.data]}")
+        if len(matching_shields) > 1:
+            raise ValueError(f"Multiple shields found for model '{model}': {matching_shields}")
+        return matching_shields[0]
+    
+    def _convert_input_to_messages(self, input: str | list[str]) -> List[Message]:
+        """Convert string input(s) to UserMessage objects."""
+        if isinstance(input, str):
+            inputs = [input]
+        else:
+            inputs = input
+        return [UserMessage(content=text) for text in inputs]
+
+    def _transform_to_moderation_results(self, shield_response: RunShieldResponse, original_input: str | list[str], shield_id: str) -> ModerationObjectResults:
+        """Transform shield response to OpenAI ModerationObjectResults format."""
+        # Determine if there's a violation
+        flagged = shield_response.violation is not None and shield_response.violation.violation_level in [ViolationLevel.ERROR, ViolationLevel.WARN]
+        # Initialize all required OpenAI categories as False (satisfies API requirement)
+        categories = {category.value: False for category in OpenAICategories}
+        category_scores = {category.value: 0.0 for category in OpenAICategories}
+        category_applied_input_types = {category.value: ["text"] for category in OpenAICategories}
+        # Extract metadata and user message
+        user_message = None
+        metadata = {}
+        if shield_response.violation:
+            user_message = shield_response.violation.user_message
+            metadata = shield_response.violation.metadata or {}
+            if flagged:
+                openai_category = self._get_openai_category_if_confident(shield_id)
+                if openai_category:
+                    categories[openai_category] = True
+                    # Use max score from results
+                    max_score = self._extract_max_score(metadata)
+                    category_scores[openai_category] = max_score
+            custom_categories = self._extract_custom_categories_from_metadata(metadata, shield_id)
+            categories.update(custom_categories["categories"])
+            category_scores.update(custom_categories["scores"])
+            category_applied_input_types.update(custom_categories["applied_input_types"]) 
+        return ModerationObjectResults(
+            flagged=flagged,
+            categories=categories,
+            category_applied_input_types=category_applied_input_types,
+            category_scores=category_scores,
+            user_message=user_message,
+            metadata=metadata
+        )
+    
+    def _get_openai_category_if_confident(self, shield_id: str) -> str | None:
+        """Only map to OpenAI category if shield name clearly indicates it. Return None otherwise."""
+        shield_lower = shield_id.lower()
+        
+        # Comprehensive mapping for all 13 OpenAI categories using enum values
+        confident_mappings = {
+            # Violence categories
+            'violence': OpenAICategories.VIOLENCE.value,  # "violence"
+            'violent': OpenAICategories.VIOLENCE.value,
+            'violence_graphic': OpenAICategories.VIOLENCE_GRAPHIC.value,  # "violence/graphic"
+            'graphic_violence': OpenAICategories.VIOLENCE_GRAPHIC.value,
+            'gore': OpenAICategories.VIOLENCE_GRAPHIC.value,
+
+            # Harassment categories (note the typo in upstream: HARASSMENT)
+            'harassment': OpenAICategories.HARASSMENT.value,  # "harassment"
+            'harass': OpenAICategories.HARASSMENT.value,
+            'bully': OpenAICategories.HARASSMENT.value,
+            'harassment_threatening': OpenAICategories.HARASSMENT_THREATENING.value,  # "harassment/threatening"
+            'threatening_harassment': OpenAICategories.HARASSMENT_THREATENING.value,
+            'threat': OpenAICategories.HARASSMENT_THREATENING.value,
+            
+            # Hate categories
+            'hate': OpenAICategories.HATE.value,  # "hate"
+            'hate_speech': OpenAICategories.HATE.value,
+            'racist': OpenAICategories.HATE.value,
+            'hate_threatening': OpenAICategories.HATE_THREATENING.value,  # "hate/threatening"
+            'threatening_hate': OpenAICategories.HATE_THREATENING.value,
+            'violent_hate': OpenAICategories.HATE_THREATENING.value,
+            
+            # Illicit categories
+            'illicit': OpenAICategories.ILLICIT.value,  # "illicit"
+            'illegal': OpenAICategories.ILLICIT.value,
+            'drug': OpenAICategories.ILLICIT.value,
+            'illicit_violent': OpenAICategories.ILLICIT_VIOLENT.value,  # "illicit/violent"
+            'violent_illicit': OpenAICategories.ILLICIT_VIOLENT.value,
+            'trafficking': OpenAICategories.ILLICIT_VIOLENT.value,
+            
+            # Sexual categories
+            'sexual': OpenAICategories.SEXUAL.value,  # "sexual"
+            'nsfw': OpenAICategories.SEXUAL.value,
+            'adult': OpenAICategories.SEXUAL.value,
+            'sexual_minors': OpenAICategories.SEXUAL_MINORS.value,  # "sexual/minors"
+            'minors_sexual': OpenAICategories.SEXUAL_MINORS.value,
+            'child_sexual': OpenAICategories.SEXUAL_MINORS.value,
+            'underage': OpenAICategories.SEXUAL_MINORS.value,
+            
+            # Self-harm categories
+            'self_harm': OpenAICategories.SELF_HARM.value,  # "self-harm"
+            'self-harm': OpenAICategories.SELF_HARM.value,
+            'selfharm': OpenAICategories.SELF_HARM.value,
+            'self_harm_intent': OpenAICategories.SELF_HARM_INTENT.value,  # "self-harm/intent"
+            'self-harm-intent': OpenAICategories.SELF_HARM_INTENT.value,
+            'suicide': OpenAICategories.SELF_HARM_INTENT.value,
+            'suicidal': OpenAICategories.SELF_HARM_INTENT.value,
+            'self_harm_instructions': OpenAICategories.SELF_HARM_INSTRUCTIONS.value,  # "self-harm/instructions"
+            'self-harm-instructions': OpenAICategories.SELF_HARM_INSTRUCTIONS.value,
+            'suicide_method': OpenAICategories.SELF_HARM_INSTRUCTIONS.value,
+            'how_to_harm': OpenAICategories.SELF_HARM_INSTRUCTIONS.value,
+        }
+        # Check for exact matches first
+        for keyword, category in confident_mappings.items():
+            if keyword in shield_lower:
+                return category
+        # Return None if not confident - all OpenAI categories stay False
+        return None
+
+    def _extract_max_score(self, metadata: dict) -> float:
+        """Extract the highest score from detection results."""
+        max_score = 0.0
+        results = metadata.get("results", [])
+        
+        for result in results:
+            if result.get("status") == "violation":
+                score = result.get("score", 0.0)
+                max_score = max(max_score, score)
+        
+        return max_score
+    
+    def _extract_custom_categories_from_metadata(self, metadata: dict, shield_id: str) -> dict:
+        """Extract custom categories from your rich detection metadata."""
+        custom_categories = {}
+        custom_scores = {}
+        custom_applied_input_types = {} 
+        results = metadata.get("results", [])
+        for result in results:
+            status = result.get("status", "pass")
+            detection_type = result.get("detection_type", "")
+            score = result.get("score", 0.0)
+            is_violation = status == "violation"
+            # Create shield-specific category for ALL processed content
+            if detection_type:
+                custom_name = f"{shield_id}_{detection_type}".lower().replace(" ", "_").replace("-", "_")
+                custom_categories[custom_name] = is_violation  # True for violations, False for pass
+                custom_scores[custom_name] = score if score is not None else 0.0
+                custom_applied_input_types[custom_name] = ["text"]
+            else:
+                # For cases where detection_type is None - use violation-focused naming
+                custom_name = f"{shield_id}_violation".lower().replace(" ", "_").replace("-", "_")
+                custom_categories[custom_name] = is_violation  # False = no violation (safe)
+                custom_scores[custom_name] = score if score is not None else 0.0
+                custom_applied_input_types[custom_name] = ["text"]
+        return {
+            "categories": custom_categories, 
+            "scores": custom_scores,
+            "applied_input_types": custom_applied_input_types,
+        }
+
+    def _create_error_moderation_result(self, error_message: str, original_input: str | list[str]) -> ModerationObjectResults:
+        """Create safe fallback moderation result for errors."""
+        return ModerationObjectResults(
+            flagged=False,  # Safe default: don't flag on errors
+            categories={category.value: False for category in OpenAICategories},
+            category_applied_input_types={category.value: ["text"] for category in OpenAICategories},
+            category_scores={category.value: 0.0 for category in OpenAICategories},
+            user_message=f"Moderation check failed: {error_message}",
+            metadata={"error": error_message, "status": "error"}
+        )
+    
     async def shutdown(self) -> None:
         """Cleanup resources"""
         logger.info(f"Provider {self._provider_id} shutting down")
